@@ -1,0 +1,216 @@
+blueprint:
+  name: Синхронизация громкости ТВ и Яндекс Станции
+  description: >-
+    Двусторонняя синхронизация громкости телевизора и Яндекс Станции
+    (интеграция AlexxIT YandexStation).
+
+
+    - Станция → ТВ: только когда ТВ включён.
+
+    - ТВ → Станция: при любом изменении громкости на включённом ТВ.
+
+    - При включении ТВ ему выставляется громкость Станции (с ожиданием,
+    пока ТВ начнёт отдавать volume_level).
+
+
+    Защита от зацикливания: игнорируется эхо собственного последнего запуска
+    (context.id изменения == context.id этой автоматизации). Изменения громкости
+    другими автоматизациями синхронизируются. Вторая линия: ничего не
+    отправляется, если устройства уже синхронны с учётом множителя и
+    округления.
+
+    Debounce: серия изменений (зажатая кнопка громкости) схлопывается,
+    синхронизируется итоговое значение.
+  domain: automation
+  author: Aleksandr Kavun
+  source_url: https://github.com/sashakavun/ha-tv-station-volume-sync/blob/main/tv_station_volume_sync.yaml
+  homeassistant:
+    min_version: 2024.10.0
+  input:
+    station:
+      name: Яндекс Станция
+      description: Колонка, которая включена всегда.
+      selector:
+        entity:
+          filter:
+            - domain: media_player
+    tv:
+      name: Телевизор
+      selector:
+        entity:
+          filter:
+            - domain: media_player
+    multiplier:
+      name: Множитель громкости
+      description: >-
+        Громкость ТВ = громкость Станции × множитель.
+        Обратное направление: Станция = ТВ ÷ множитель.
+        Результат ограничивается диапазоном 0–100%.
+      default: 1
+      selector:
+        number:
+          min: 0.1
+          max: 5
+          step: 0.05
+          mode: box
+    round_to_station_step:
+      name: Округлять до шага Станции
+      description: >-
+        При изменении громкости на ТВ отправлять на Станцию значение,
+        округлённое до ближайшей ступени (шаг 0.1). Без округления
+        отправляется точное значение.
+      default: true
+      selector:
+        boolean: {}
+    debounce_ms:
+      name: Debounce, мс
+      description: >-
+        Пауза после последнего изменения громкости перед синхронизацией.
+        0 — без задержки.
+      default: 400
+      selector:
+        number:
+          min: 0
+          max: 3000
+          step: 50
+          unit_of_measurement: ms
+          mode: slider
+    tv_ready_timeout:
+      name: Ожидание готовности ТВ, с
+      description: >-
+        Сколько ждать после включения ТВ, пока он начнёт отдавать громкость.
+        Если не дождались — синхронизация при включении пропускается.
+      default: 20
+      selector:
+        number:
+          min: 1
+          max: 120
+          unit_of_measurement: s
+          mode: slider
+
+mode: restart
+
+variables:
+  station: !input station
+  tv: !input tv
+  k: !input multiplier
+  do_round: !input round_to_station_step
+  debounce_ms: !input debounce_ms
+  tv_ready_timeout: !input tv_ready_timeout
+  station_step: 0.1
+  tolerance: 0.005
+  off_states: ["off", "standby", "unavailable", "unknown"]
+
+triggers:
+  - trigger: state
+    entity_id: !input station
+    attribute: volume_level
+    id: station_volume
+  - trigger: state
+    entity_id: !input tv
+    attribute: volume_level
+    id: tv_volume
+  - trigger: state
+    entity_id: !input tv
+    from: ["off", "standby", "unavailable", "unknown"]
+    not_to: ["off", "standby", "unavailable", "unknown"]
+    id: tv_on
+
+# Фильтр стоит на уровне conditions, а не actions: при mode: restart
+# отфильтрованное событие не должно прерывать уже идущий запуск.
+#
+# Эхо собственного запуска: this — состояние этой автоматизации, снятое до
+# проверки условий; его context.id равен контексту последнего успешного
+# запуска, а volume_set из этого запуска порождает состояние устройства
+# с тем же context.id.
+conditions:
+  - condition: template
+    value_template: >-
+      {% if trigger.id == 'tv_on' %}
+        {{ true }}
+      {% else %}
+        {% set fs = trigger.from_state %}
+        {% set ts = trigger.to_state %}
+        {% set own_ctx = this.context.id if this is not none and this.context is defined else none %}
+        {{ fs is not none and ts is not none
+           and (own_ctx is none or ts.context.id != own_ctx)
+           and fs.state not in off_states
+           and ts.state not in off_states
+           and fs.attributes.get('volume_level') is number
+           and ts.attributes.get('volume_level') is number
+           and (trigger.id == 'tv_volume' or states(tv) not in off_states) }}
+      {% endif %}
+
+actions:
+  - if:
+      - condition: template
+        value_template: "{{ trigger.id != 'tv_on' and debounce_ms | int(0) > 0 }}"
+    then:
+      - delay:
+          milliseconds: "{{ debounce_ms | int(0) }}"
+
+  - choose:
+      # ТВ → Станция
+      - conditions:
+          - condition: trigger
+            id: tv_volume
+        sequence:
+          - condition: template
+            value_template: >-
+              {{ states(tv) not in off_states
+                 and state_attr(tv, 'volume_level') is number
+                 and state_attr(station, 'volume_level') is number }}
+          - variables:
+              target: >-
+                {% set v = state_attr(tv, 'volume_level') / k %}
+                {% set v = [[v, 0] | max, 1] | min %}
+                {% if do_round %}
+                  {% set v = ((v / station_step) | round(0)) * station_step %}
+                {% endif %}
+                {{ v | round(3) }}
+          - condition: template
+            value_template: >-
+              {{ (target | float - state_attr(station, 'volume_level')) | abs >= tolerance }}
+          - action: media_player.volume_set
+            target:
+              entity_id: "{{ station }}"
+            data:
+              volume_level: "{{ target }}"
+
+    # Станция → ТВ (изменение на Станции или включение ТВ)
+    default:
+      - wait_template: >-
+          {{ states(tv) not in off_states
+             and state_attr(tv, 'volume_level') is number }}
+        timeout:
+          seconds: "{{ tv_ready_timeout | int(20) }}"
+        continue_on_timeout: false
+      - condition: template
+        value_template: "{{ state_attr(station, 'volume_level') is number }}"
+      - variables:
+          target: >-
+            {% set v = state_attr(station, 'volume_level') * k %}
+            {{ ([[v, 0] | max, 1] | min) | round(2) }}
+          # Громкость ТВ, пересчитанная в шкалу Станции (как в ветке ТВ → Станция).
+          tv_as_station: >-
+            {% set v = state_attr(tv, 'volume_level') / k %}
+            {% set v = [[v, 0] | max, 1] | min %}
+            {% if do_round %}
+              {% set v = ((v / station_step) | round(0)) * station_step %}
+            {% endif %}
+            {{ v | round(3) }}
+      # Изменение на Станции: если ТВ уже ей соответствует (с учётом множителя
+      # и округления) — не трогаем ТВ. Гасит непойманное эхо без «прилипания»
+      # ТВ к сетке Станции. При включении ТВ выставляем точно.
+      - condition: template
+        value_template: >-
+          {{ trigger.id == 'tv_on'
+             or (tv_as_station | float - state_attr(station, 'volume_level')) | abs >= tolerance }}
+      - condition: template
+        value_template: >-
+          {{ (target | float - state_attr(tv, 'volume_level')) | abs >= tolerance }}
+      - action: media_player.volume_set
+        target:
+          entity_id: "{{ tv }}"
+        data:
+          volume_level: "{{ target }}"
